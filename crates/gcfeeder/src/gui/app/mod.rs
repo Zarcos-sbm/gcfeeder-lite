@@ -330,8 +330,10 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.handle_messages(frame);
 
+        // Repaint at ~15 fps while visible instead of in a tight loop; nothing at all
+        // while hidden in the tray.
         if !self.hidden {
-            ctx.request_repaint();
+            ctx.request_repaint_after(Duration::from_millis(66));
         }
 
         if let Some(editor_profile) = self.editor_profile.as_mut() {
