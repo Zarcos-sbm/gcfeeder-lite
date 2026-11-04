@@ -1,0 +1,17 @@
+[package]
+name = "gcfeeder-lite"
+version = "0.1.0"
+edition = "2021"
+description = "Headless, minimal-CPU frontend for gcfeeder"
+
+[dependencies]
+gcfeeder-core = { path = "../gcfeeder-core" }
+log = { version = "0.4.17", features = ["std"] }
+rusb = "0.9.1"
+serde = { version = "1.0.144", features = ["derive"] }
+toml = "0.5.9"
+
+[features]
+# Build with `--features background` to run with no console window at all
+# (stop it from Task Manager or with `taskkill /im gcfeeder-lite.exe`).
+background = []

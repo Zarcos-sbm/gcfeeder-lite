@@ -12,12 +12,11 @@ use enclose::enclose;
 use enum_iterator::Sequence;
 use gcinput::Input;
 use log::warn;
-use rayon::prelude::{IntoParallelRefMutIterator, ParallelIterator};
 use rusb::UsbContext;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    adapter::poller::{self, ERROR_TIMEOUT},
+    adapter::poller::{self, ERROR_TIMEOUT, MAX_BACKOFF},
     bridge::{
         self,
         vigem::{Config as ViGEmConfig, ViGEmBridge},
@@ -44,8 +43,10 @@ pub type CalibrationSender = recent::Sender<Option<Input>>;
 pub type CalibrationReceiver = recent::Receiver<Option<Input>>;
 pub type Layer = dyn mapping::Layer + Send;
 
-// TODO: Make this come from the poll rate on the adapter.
-pub const INPUT_TIMEOUT: Duration = Duration::from_millis(8);
+// The poller sends a message every ~8 ms while the adapter is connected and
+// `recv_timeout` returns as soon as one arrives, so this value only bounds how
+// long the thread sleeps when there is nothing to do (e.g. adapter unplugged).
+pub const INPUT_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub struct Feeder<T: UsbContext + 'static> {
     context: Arc<Context<T>>,
@@ -131,7 +132,6 @@ struct Context<T: UsbContext> {
     pub callbacks: Mutex<Vec<Box<Callback>>>,
     pub senders: Mutex<Vec<Sender>>,
     pub average_feed_time: Mutex<Option<Duration>>,
-    pub thread_pool: rayon::ThreadPool,
 }
 
 impl<T: UsbContext> Context<T> {
@@ -145,10 +145,6 @@ impl<T: UsbContext> Context<T> {
             calibration_sender: Default::default(),
             senders: Default::default(),
             average_feed_time: Default::default(),
-            thread_pool: rayon::ThreadPoolBuilder::new()
-                .num_threads(2)
-                .build()
-                .unwrap(),
         }
     }
 
@@ -160,17 +156,24 @@ impl<T: UsbContext> Context<T> {
     ) {
         let mut bridge: Option<Box<Bridge>> = None;
         let mut timer = AverageTimer::start(0.9).unwrap();
+        let mut backoff = ERROR_TIMEOUT;
+        // Last state sent to the virtual pad, to skip redundant driver calls.
+        let mut last_fed: Option<Option<Input>> = None;
 
         while !self.stop_flag.load(Ordering::Acquire) {
             let record = {
                 let bridge = match self.bridge_or_reload(&mut bridge) {
                     Ok(b) => b,
                     Err(e) => {
-                        warn!("Failed to connect to bridge: {}", e);
-                        thread::sleep(ERROR_TIMEOUT);
+                        if backoff == ERROR_TIMEOUT {
+                            warn!("Failed to connect to bridge: {}", e);
+                        }
+                        thread::sleep(backoff);
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
                         continue;
                     }
                 };
+                backoff = ERROR_TIMEOUT;
 
                 timer.reset();
 
@@ -208,7 +211,13 @@ impl<T: UsbContext> Context<T> {
                             }
                         };
 
-                        bridge.feed(&layered).map(|()| Record {
+                        let fed = if last_fed == Some(layered) {
+                            Ok(())
+                        } else {
+                            bridge.feed(&layered).map(|()| last_fed = Some(layered))
+                        };
+
+                        fed.map(|()| Record {
                             raw_input: input,
                             layered_input: layered,
                             feed_time: timer.read(),
@@ -222,30 +231,26 @@ impl<T: UsbContext> Context<T> {
             match record {
                 Ok(record) => {
                     {
-                        self.thread_pool.join(
-                            || {
-                                let mut callbacks = self.callbacks.lock().unwrap();
-                                callbacks
-                                    .par_iter_mut()
-                                    .for_each(|callback| callback(&record));
-                            },
-                            || {
-                                let mut senders = self.senders.lock().unwrap();
+                        let mut callbacks = self.callbacks.lock().unwrap();
+                        callbacks.iter_mut().for_each(|callback| callback(&record));
+                    }
 
-                                senders.retain(|sender| {
-                                    !matches!(
-                                        sender.try_send(record),
-                                        Err(TrySendError::Disconnected(_))
-                                    )
-                                });
-                            },
-                        );
+                    {
+                        let mut senders = self.senders.lock().unwrap();
+
+                        senders.retain(|sender| {
+                            !matches!(
+                                sender.try_send(record),
+                                Err(TrySendError::Disconnected(_))
+                            )
+                        });
                     }
 
                     *self.average_feed_time.lock().unwrap() = Some(timer.lap());
                 }
                 Err(e) => {
                     bridge = None;
+                    last_fed = None;
                     warn!("Bridge error: {}", e);
                     continue;
                 }

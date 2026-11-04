@@ -25,6 +25,8 @@ pub type InputMessage = Option<Input>;
 type SenderData = (recent::Sender<InputMessage>, Port);
 
 pub const ERROR_TIMEOUT: Duration = Duration::from_millis(8);
+pub const MAX_BACKOFF: Duration = Duration::from_secs(1);
+const RUMBLE_REFRESH: Duration = Duration::from_millis(250);
 
 pub struct Poller<T: UsbContext + 'static> {
     context: Arc<Context<T>>,
@@ -95,29 +97,48 @@ impl<T: UsbContext> Context<T> {
     }
 
     pub fn poll_loop(&self) {
-        let thread_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap();
         let mut adapter: Option<Adapter<T>> = None;
         let mut timer = AverageTimer::start(0.9).unwrap();
+        let mut backoff = ERROR_TIMEOUT;
+        let mut last_rumble: Option<[Rumble; Port::COUNT]> = None;
+        let mut last_rumble_write = Instant::now();
 
         while !self.stop_flag.load(Ordering::Acquire) {
             let result = {
                 let adapter = match self.adapter_or_reload(&mut adapter) {
                     Ok(a) => a,
                     Err(e) => {
-                        warn!("Failed to connect to adapter: {}", e);
-                        thread::sleep(ERROR_TIMEOUT);
+                        // Adapter absent: retry with an increasing delay (8 ms -> 1 s)
+                        // instead of re-enumerating USB devices 125 times per second.
+                        if backoff == ERROR_TIMEOUT {
+                            warn!("Failed to connect to adapter: {}", e);
+                        }
+                        thread::sleep(backoff);
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
                         continue;
                     }
                 };
+                backoff = ERROR_TIMEOUT;
 
                 timer.reset();
-                let (input, rumble) = thread_pool.join(
-                    || self.process_input(adapter),
-                    || self.process_rumble(adapter),
-                );
+
+                // The read blocks until the adapter has a new report (~8 ms), so the
+                // thread sleeps in the kernel instead of burning CPU.
+                let input = self.process_input(adapter);
+
+                // Only talk to the adapter for rumble when the state changed, plus a
+                // slow refresh as a safety net.
+                let rumble_now = array::from_fn(|i| self.rumble_states[i].load());
+                let rumble = if input.is_ok()
+                    && (last_rumble != Some(rumble_now)
+                        || last_rumble_write.elapsed() >= RUMBLE_REFRESH)
+                {
+                    last_rumble = Some(rumble_now);
+                    last_rumble_write = Instant::now();
+                    adapter.write_rumble(rumble_now)
+                } else {
+                    Ok(())
+                };
 
                 input.and(rumble)
             };
@@ -126,6 +147,7 @@ impl<T: UsbContext> Context<T> {
                 Err(super::Error::Usb(rusb::Error::Timeout)) => continue,
                 Err(e) => {
                     adapter = None;
+                    last_rumble = None;
                     warn!("Adapter error: {}", e);
                     continue;
                 }
@@ -151,10 +173,6 @@ impl<T: UsbContext> Context<T> {
         });
 
         Ok(())
-    }
-
-    fn process_rumble(&self, adapter: &Adapter<T>) -> super::Result<()> {
-        adapter.write_rumble(array::from_fn(|i| self.rumble_states[i].load()))
     }
 
     fn adapter_or_reload<'a>(
